@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint & unit tests (Flask API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt ruff==0.12.4
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Run unit tests
+        run: pytest -v
+
+  build-and-smoke-test:
+    name: Build images & smoke test
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Dockerfiles (hadolint)
+        run: |
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --failure-threshold error - < nginx-web/Dockerfile
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --failure-threshold error - < Dockerfile
+
+      - name: Build Nginx image (Task C1)
+        run: docker build -t my-nginx:1.0 ./nginx-web
+
+      - name: Smoke test standalone Nginx container
+        run: |
+          docker run -d --name web -p 8080:80 my-nginx:1.0
+          for i in $(seq 1 10); do curl -fs http://localhost:8080 >/dev/null && break; sleep 1; done
+          curl -fs http://localhost:8080 | grep "Hello from Nginx in Docker!"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/missing)" = "404"
+          docker logs web
+          docker rm -f web
+
+      - name: Build and start the stack with Docker Compose
+        run: docker compose up -d --build --wait
+
+      - name: Smoke test the stack (Nginx -> Flask API)
+        run: |
+          docker compose ps
+          curl -fs http://localhost:8080/ | grep "Hello from Nginx in Docker!"
+          curl -fs http://localhost:8080/api/ | grep "Hello from DevOps Bootcamp"
+          test "$(curl -fs http://localhost:8080/api/health)" = "ok"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+      - name: Trivy vulnerability scan (report only)
+        run: |
+          for img in my-nginx:1.0 bootcamp-api:1.0; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:0.58.1 image --severity HIGH,CRITICAL --exit-code 0 --no-progress "$img"
+          done
+
+  terraform:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate
